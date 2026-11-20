@@ -526,6 +526,52 @@ byId('done').onclick = () => modal.close();
 modal.addEventListener('close', () => { resetScanner(); clearTimeout(timer); if (!byId('result').hidden) { form.reset(); updateReceipt(); updateStars(); } inputs.forEach(input => input.value = ''); });
 selectLanguage(initialLanguage([...(navigator.languages || []), navigator.language]));
 
+// The number may be printed at different heights on the front or back.
+const scanRegions = [
+  [0,1,false,false], [.48,.45,true,false], [.21,.45,true,false],
+  [0,.43,true,false], [.62,.37,true,false], [0,1,false,true],
+  [.48,.45,true,true], [.21,.45,true,true], [0,.43,true,true], [.62,.37,true,true]
+];
+function normalizePixels(pixels, invert) {
+  const histogram = new Uint32Array(256);
+  for (let i = 0; i < pixels.length; i += 4) {
+    const gray = Math.round(.299*pixels[i] + .587*pixels[i+1] + .114*pixels[i+2]);
+    histogram[gray]++;
+    pixels[i] = gray;
+  }
+  const count = pixels.length / 4;
+  let low = 0, high = 255, sum = 0;
+  while (low < 255 && (sum += histogram[low]) < count*.01) low++;
+  sum = 0;
+  while (high > low && (sum += histogram[high]) < count*.01) high--;
+  const range = Math.max(20,high-low);
+  for (let i = 0; i < pixels.length; i += 4) {
+    const gray = Math.max(0,Math.min(255,Math.round((pixels[i]-low)*255/range)));
+    pixels[i] = pixels[i+1] = pixels[i+2] = invert ? 255-gray : gray;
+  }
+}
+function prepareRegion(frame, region) {
+  const [top, fraction,, invert] = region;
+  const canvas = document.createElement('canvas');
+  const height = Math.max(1,Math.round(frame.height*fraction));
+  canvas.width = frame.width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(frame,0,Math.floor(frame.height*top),frame.width,height,0,0,canvas.width,height);
+  const data = ctx.getImageData(0,0,canvas.width,canvas.height);
+  normalizePixels(data.data,invert);
+  ctx.putImageData(data,0,0);
+  return canvas;
+}
+async function readRegion(worker, engine, frame, region) {
+  await worker.setParameters({
+    tessedit_char_whitelist:'0123456789 -.',
+    tessedit_pageseg_mode:region[2] ? engine.PSM.SINGLE_LINE : engine.PSM.SPARSE_TEXT
+  });
+  const result = await worker.recognize(prepareRegion(frame,region));
+  return findCardNumber(result.data.text);
+}
+
 async function autoScan(request, enginePromise) {
   const active = () => request === cameraRequest && camera.open;
   const status = byId('cameraStatus');
@@ -539,28 +585,13 @@ async function autoScan(request, enginePromise) {
     const deadline = Date.now() + 35000;
     let previous = '';
     let pass = 0;
-    const line = document.createElement('canvas');
+    let retryRegion = null;
     while (active() && Date.now() < deadline) {
       const frame = captureFrame();
       if (frame) {
-        const crop = pass++ % 2 === 0;
-        let image = frame;
-        if (crop) {
-          line.width = frame.width;
-          line.height = Math.round(frame.height * .45);
-          const ctx = line.getContext('2d');
-          ctx.filter = 'grayscale(1) contrast(1.35)';
-          ctx.drawImage(frame,0,Math.round(frame.height*.35),line.width,line.height,0,0,line.width,line.height);
-          image = line;
-        }
-        await worker.setParameters({
-          tessedit_char_whitelist:'0123456789 -',
-          tessedit_pageseg_mode:crop ? engine.PSM.SINGLE_LINE : engine.PSM.SPARSE_TEXT
-        });
+        const region = retryRegion || scanRegions[pass++ % scanRegions.length];
+        const number = await readRegion(worker,engine,frame,region);
         if (!active()) return;
-        const result = await worker.recognize(image);
-        if (!active()) return;
-        const number = findCardNumber(result.data.text);
         if (number && number === previous) {
           stopCamera();
           camera.close();
@@ -569,7 +600,8 @@ async function autoScan(request, enginePromise) {
           scanStatus(strings.scanCheck);
           return;
         }
-        if (number) previous = number;
+        previous = number;
+        retryRegion = number ? region : null;
       }
       await new Promise(resolve => setTimeout(resolve,300));
     }
@@ -597,20 +629,24 @@ async function scanImage(image) {
     if (version !== scanVersion) return;
     worker = await engine.createWorker('eng');
     if (version !== scanVersion) return;
-    await worker.setParameters({
-      tessedit_char_whitelist: '0123456789 -',
-      tessedit_pageseg_mode: engine.PSM.SPARSE_TEXT
-    });
-    const {data} = await worker.recognize(image);
-    if (version !== scanVersion) return;
-    let number = findCardNumber(data.text);
-    if (!number) {
-      await worker.setParameters({tessedit_pageseg_mode: engine.PSM.SINGLE_BLOCK});
-      if (version !== scanVersion) return;
-      const retry = await worker.recognize(image);
-      number = findCardNumber(retry.data.text);
-      if (version !== scanVersion) return;
+    const bitmap = await createImageBitmap(image);
+    let frame;
+    try {
+      frame = document.createElement('canvas');
+      const scale = Math.min(1,1600/Math.max(bitmap.width,bitmap.height));
+      frame.width = Math.max(1,Math.round(bitmap.width*scale));
+      frame.height = Math.max(1,Math.round(bitmap.height*scale));
+      frame.getContext('2d').drawImage(bitmap,0,0,frame.width,frame.height);
+    } finally {
+      bitmap.close();
     }
+    let number = '';
+    for (const region of scanRegions) {
+      if (version !== scanVersion) return;
+      number = await readRegion(worker,engine,frame,region);
+      if (number) break;
+    }
+    if (version !== scanVersion) return;
     if (!number) {
       scanStatus(strings.scanMiss);
       return;
